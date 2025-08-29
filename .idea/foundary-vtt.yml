@@ -1,0 +1,523 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Container Configuration
+        Parameters:
+          - DockerImage
+          - ContainerCpu
+          - ContainerMemory
+          - ContainerPort
+      - Label:
+          default: Networking
+        Parameters:
+          - VpcCidr
+          - PublicSubnet1Cidr
+          - PrivateSubnet1Cidr
+      - Label:
+          default: Storage
+        Parameters:
+          - EbsVolumeSize
+          - EbsVolumeType
+      - Label:
+          default: Foundry Credentials
+        Parameters:
+          - FoundryUsername
+          - FoundryPassword
+      - Label:
+          default: Domain & SSL
+        Parameters:
+          - DomainName
+    ParameterLabels:
+      DockerImage:
+        default: Docker Image
+      ContainerCpu:
+        default: Container CPU Units
+      ContainerMemory:
+        default: Container Memory (MiB)
+      ContainerPort:
+        default: Container exposed port
+      VpcCidr:
+        default: VPC CIDR Block
+      PublicSubnet1Cidr:
+        default: Public Subnet CIDR
+      PrivateSubnet1Cidr:
+        default: Private Subnet CIDR
+      EbsVolumeSize:
+        default: EBS Volume Size (GiB)
+      EbsVolumeType:
+        default: EBS Volume Type
+      FoundryUsername:
+        default: Foundry VTT Username
+      FoundryPassword:
+        default: Foundry VTT Password
+      DomainName:
+        default: Domain Name for SSL
+Description: Deploy Foundary on AWS ECS using CloudFormation
+
+Parameters:
+  ContainerPort:
+    Type: Number
+    Default: '30000'
+    Description: Port Foundry container exposes
+    
+  DockerImage:
+    Type: String
+    Default: felddy/foundryvtt:13
+    Description: Docker image to deploy
+
+  ContainerCpu:
+    Type: Number
+    Default: '1024'
+    Description: CPU units for the container
+
+  ContainerMemory:
+    Type: Number
+    Default: '2048'
+    Description: Memory (MiB) for the container
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for the public subnet
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for the private subnet
+
+  EbsVolumeSize:
+    Type: Number
+    Default: '20'
+    Description: Size of the EBS volume in GiB
+
+  EbsVolumeType:
+    Type: String
+    Default: gp3
+    AllowedValues:
+      - gp2
+      - gp3
+      - io1
+      - io2
+    Description: Type of EBS volume
+
+  FoundryUsername:
+    Type: String
+    NoEcho: true
+    Description: Foundry VTT username
+
+  FoundryPassword:
+    Type: String
+    NoEcho: true
+    Description: Foundry VTT password
+
+  DomainName:
+    Type: String
+    Description: The domain name for the ACM certificate (e.g., foundry.example.com)
+
+Resources:
+  LambdaScaleDownRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: ECSScaleDownPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:DescribeTasks
+                  - ecs:ListTasks
+                  - ecs:UpdateService
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:CreateSnapshot
+                  - ec2:DescribeSnapshots
+                  - ec2:DeleteSnapshot
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: FoundaryLambdaScaleDownRole
+
+  LambdaScaleDownFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: FoundaryScaleDownLambda
+      Handler: index.handler
+      Role: !GetAtt LambdaScaleDownRole.Arn
+      Runtime: python3.12
+      Timeout: 60
+    Code: null
+    ZipFile: |
+      import boto3
+      import os
+      from datetime import datetime, timezone
+
+      CLUSTER = os.environ['CLUSTER']
+      SERVICE = os.environ['SERVICE']
+      VOLUME_ID = os.environ['VOLUME_ID']
+      MAX_RUNTIME_HOURS = int(os.environ.get('MAX_RUNTIME_HOURS', '5'))
+      SNAPSHOT_LIMIT = int(os.environ.get('SNAPSHOT_LIMIT', '10'))
+
+      def handler(event, context):
+        ecs = boto3.client('ecs')
+        ec2 = boto3.client('ec2')
+        tasks = ecs.list_tasks(cluster=CLUSTER, serviceName=SERVICE, desiredStatus='RUNNING')['taskArns']
+        if not tasks:
+          return {'status': 'No running tasks'}
+        desc = ecs.describe_tasks(cluster=CLUSTER, tasks=tasks)
+        now = datetime.now(timezone.utc)
+        for task in desc['tasks']:
+          started = task['startedAt']
+          runtime = (now - started).total_seconds() / 3600
+          if runtime >= MAX_RUNTIME_HOURS:
+            # Create snapshot
+            snap = ec2.create_snapshot(
+              VolumeId=VOLUME_ID,
+              Description=f'Foundary snapshot {now.isoformat()}',
+              TagSpecifications=[{
+                'ResourceType': 'snapshot',
+                'Tags': [
+                  {'Key': 'Name', 'Value': f'FoundarySnapshot-{now.strftime("%Y%m%d-%H%M%S")}'},
+                  {'Key': 'CreatedBy', 'Value': 'ScaleDownLambda'}
+                ]
+              }]
+            )
+            # Delete old snapshots, keep only newest SNAPSHOT_LIMIT
+            snaps = ec2.describe_snapshots(Filters=[{'Name': 'volume-id', 'Values': [VOLUME_ID]}])['Snapshots']
+            snaps = sorted(snaps, key=lambda s: s['StartTime'], reverse=True)
+            for old_snap in snaps[SNAPSHOT_LIMIT:]:
+              ec2.delete_snapshot(SnapshotId=old_snap['SnapshotId'])
+            ecs.update_service(cluster=CLUSTER, service=SERVICE, desiredCount=0)
+            return {'status': f'Scaled down and snapshot created after {runtime:.2f} hours'}
+        return {'status': 'No scale down needed'}
+      Environment:
+        Variables:
+          CLUSTER: !Ref ECSCluster
+          SERVICE: FoundaryService
+          VOLUME_ID: !Ref EBSVolume
+          MAX_RUNTIME_HOURS: '5'
+          SNAPSHOT_LIMIT: '10'
+      Tags:
+        - Key: Name
+          Value: FoundaryScaleDownLambda
+
+  ScaleDownEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: FoundaryScaleDownEventRule
+      ScheduleExpression: rate(1 hour)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LambdaScaleDownFunction.Arn
+          Id: FoundaryScaleDownLambdaTarget
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: FoundaryVPC
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1Cidr
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: FoundaryPublicSubnet1
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: FoundaryPrivateSubnet1
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: FoundaryIGW
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: FoundaryPublicRouteTable
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: FoundaryPrivateRouteTable
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow inbound traffic to ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          CidrIp: !Ref AllowedIp
+      Tags:
+        - Key: Name
+          Value: FoundaryALBSecurityGroup
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow traffic from ALB to ECS
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: FoundaryECSSecurityGroup
+
+  ACMCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      Tags:
+        - Key: Name
+          Value: FoundaryACMCertificate
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: FoundaryALB
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnet1
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Type: application
+      IpAddressType: ipv4
+      Tags:
+        - Key: Name
+          Value: FoundaryALB
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: FoundaryTargetGroup
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      Port: !Ref ContainerPort
+      TargetType: ip
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: !Ref ContainerPort
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: 200-399
+      Tags:
+        - Key: Name
+          Value: FoundaryTargetGroup
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn: ACMCertificate
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-2016-08
+      Certificates:
+        - CertificateArn: !Ref ACMCertificate
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: FoundaryECSCluster
+      Tags:
+        - Key: Name
+          Value: FoundaryECSCluster
+
+  ECSExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Tags:
+        - Key: Name
+          Value: FoundaryECSExecutionRole
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Tags:
+        - Key: Name
+          Value: FoundaryECSTaskRole
+
+  # Container Resources
+
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: FoundaryTaskDefinition
+      Cpu: !Ref ContainerCpu
+      Memory: !Ref ContainerMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: foundryvtt
+          Image: !Ref DockerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          Environment:
+            - Name: FOUNDRY_USERNAME
+              Value: !Ref FoundryUsername
+            - Name: FOUNDRY_PASSWORD
+              Value: !Ref FoundryPassword
+          MountPoints:
+            - SourceVolume: foundary-data
+              ContainerPath: /data
+      Volumes:
+        - Name: foundary-data
+          EBSVolumeConfiguration:
+            VolumeId: !Ref EBSVolume
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListener
+    Properties:
+      Cluster: !Ref ECSCluster
+      ServiceName: FoundaryService
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+      TaskDefinition: !Ref ECSTaskDefinition
+      LoadBalancers:
+        - ContainerName: foundryvtt
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref ALBTargetGroup
+
+# --- Outputs ---
+Outputs:
+  ALBDNSName:
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+
+  ECSClusterName:
+    Description: Name of the ECS Cluster
+    Value: !Ref ECSCluster
+
+  ECSServiceName:
+    Description: Name of the ECS Service
+    Value: !Ref ECSService
+
+  EBSVolumeId:
+    Description: ID of the EBS Volume
+    Value: !Ref EBSVolume
+
+  ACMCertificateArn:
+    Description: ARN of the ACM Certificate
+    Value: !Ref ACMCertificate
