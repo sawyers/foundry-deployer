@@ -10,6 +10,11 @@ jobs:
       - run: echo "The name of your branch is ${{ github.ref }} and your repository is ${{ github.repository }}" 
       - name: Checkout repository
         uses: actions/checkout@v4
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::177583829954:role/GitHub-Runner-Role
+          aws-region: us-east-1
       - run: echo "The ${{ github.repository }} repository has been cloned to the runner"
       - run: echo "The workflow is now ready to test your code on the runner"
       - name: List files in the repository
